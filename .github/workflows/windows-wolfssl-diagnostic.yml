@@ -1,0 +1,172 @@
+name: Windows wolfSSL diagnostic
+'on':
+  push:
+    branches:
+    - diagnostics/windows-wolfssl-20261105
+permissions:
+  contents: read
+env:
+  CURL_CI: github
+  CURL_TEST_MIN: 1760
+  CURL_TEST_SSH_KEYALGO: ed25519
+  DO_NOT_TRACK: '1'
+  OPENSSH_WINDOWS_VERSION: 10.4.0.0p1-Preview
+  OPENSSH_WINDOWS_SHA256_ARM64: d2b1928225479fec9e0c938f527fdb5ed676446cca1bbcc5af84aca1f272842e
+  OPENSSH_WINDOWS_SHA256_WIN64: b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957
+  STUNNEL_VERSION: 5.82
+jobs:
+  wolfssl:
+    name: ${{ matrix.sys == 'msys' && 'msys2' || 'mingw' }}, ${{ matrix.build == 'cmake' && 'CM' || 'AM' }} ${{ matrix.env }} ${{ matrix.name }} ${{ matrix.test }}
+    runs-on: ${{ matrix.image || 'windows-2022' }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      LDFLAGS: -s
+      MAKEFLAGS: -j 5
+      MATRIX_BUILD: ${{ matrix.build }}
+      MATRIX_ENV: ${{ matrix.env }}
+      MATRIX_OPENSSH: ${{ matrix.openssh }}
+      MATRIX_SYS: ${{ matrix.sys }}
+      MATRIX_TEST: ${{ matrix.test }}
+      ACTIONS_STEP_DEBUG: 'true'
+      ACTIONS_RUNNER_DEBUG: 'true'
+    strategy:
+      matrix:
+        include:
+        - name: wolfssl c-ares U
+          build: autotools
+          sys: ucrt64
+          env: ucrt-x86_64
+          tflags: ''
+          config: --enable-debug --with-wolfssl --enable-windows-unicode --enable-ares --enable-static --disable-shared --enable-ca-native
+          install: mingw-w64-ucrt-x86_64-wolfssl
+          test: ''
+          image: ''
+          openssh: ''
+          cppflags: ''
+          chkprefill: ''
+          type: ''
+      fail-fast: false
+    steps:
+    - name: preinstalled tools
+      shell: bash
+      run: echo '::group::MSYS2 packages'; /c/msys64/usr/bin/pacman.exe -Q || true; echo '::endgroup::'
+    - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+      if: ${{ matrix.sys == 'msys' }}
+      with:
+        msystem: ${{ matrix.sys }}
+        install: gcc perl zlib-devel brotli-devel libzstd-devel libpsl-devel libnghttp2-devel openssl-devel libssh2-devel
+    - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+      if: ${{ matrix.sys != 'msys' }}
+      with:
+        msystem: ${{ matrix.sys }}
+        install: perl diffutils mingw-w64-${{ matrix.env }}-cc mingw-w64-${{ matrix.env }}-libpsl mingw-w64-${{ matrix.env }}-libssh2 mingw-w64-${{ matrix.env }}-c-ares mingw-w64-${{ matrix.env }}-nghttp3 mingw-w64-${{ matrix.env }}-ngtcp2 mingw-w64-${{ matrix.env }}-openssl
+    - name: install prereqs
+      env:
+        MATRIX_INSTALL: ${{ matrix.install }}
+      run: "# Install build tools in a separate step to avoid inflating shared cache size and being installed even if unused.\nif [ \"${MATRIX_SYS}\" = 'msys' ]; then\n  if [ \"${MATRIX_BUILD}\" = 'cmake' ]; then\n    pkgs='cmake ninja'\n  else\n    pkgs='autotools'\n  fi\nelse\n  if [ \"${MATRIX_BUILD}\" = 'cmake' ]; then\n    pkgs=\"mingw-w64-${MATRIX_ENV}-cmake\"\n  else\n    pkgs=\"mingw-w64-${MATRIX_ENV}-autotools\"\n  fi\nfi\n/usr/bin/pacman --noconfirm --noprogressbar --sync --needed ${pkgs} ${MATRIX_INSTALL}\n"
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Record candidate and restrict test helper listeners
+      shell: python
+      run: "from pathlib import Path\nimport subprocess, json, hashlib\nout = Path('diagnostics-output'); out.mkdir(exist_ok=True)\nassert subprocess.check_output(['git', 'rev-parse', 'HEAD^'], text=True).strip() == 'bd176a5be8307416dfff90a2ecfb9ac4b28af505'\nassert not subprocess.check_output(['git', 'diff', 'HEAD^', 'HEAD', '--', 'lib', 'src', 'tests'], text=True).strip()\nchanges = {}\nfor name in ['util.c', 'rtspd.c', 'sockfilt.c', 'socksd.c']:\n    path = Path('tests/server') / name\n    text = path.read_text()\n    changes[name] = {'ipv4': text.count('= INADDR_ANY;'), 'ipv6': text.count('= in6addr_any;')}\n    text = text.replace('= INADDR_ANY;', '= htonl(INADDR_LOOPBACK);').replace('= in6addr_any;', '= in6addr_loopback;')\n    path.write_text(text)\n(out / 'loopback-changes.json').write_text(json.dumps(changes, indent=2))\n(out / 'test-helper.diff').write_text(subprocess.check_output(['git', 'diff', '--', 'tests/server'], text=True))\n(out / 'candidate.json').write_text(json.dumps({'runtime_commit':\
+        \ 'bd176a5be8307416dfff90a2ecfb9ac4b28af505', 'diagnostic_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'native_source_sha256': hashlib.sha256(Path('lib/cf-https-connect.c').read_bytes()).hexdigest(), 'test_helper_loopback_deviation': True}, indent=2))\n"
+    - name: autoreconf
+      if: ${{ matrix.build == 'autotools' }}
+      timeout-minutes: 2
+      run: autoreconf -fi
+    - name: configure
+      timeout-minutes: 5
+      env:
+        CPPFLAGS: ${{ matrix.cppflags }}
+        MATRIX_CHKPREFILL: ${{ matrix.chkprefill }}
+        MATRIX_CONFIG: ${{ matrix.config }}
+        MATRIX_TYPE: ${{ matrix.type }}
+        TFLAGS: ${{ matrix.tflags }}
+      run: "CPPFLAGS+=' -DCURL_DEBUG_NO_WIN32_WND'\nif [ \"${MATRIX_TEST}\" = 'uwp' ]; then\n  CPPFLAGS+=' -DWINSTORECOMPAT -DWINAPI_FAMILY=WINAPI_FAMILY_APP -D_WIN32_WINNT=0x0a00'\n  if [[ \"${MATRIX_ENV}\" != 'clang'* ]]; then\n    specs=\"$(realpath gcc-specs-uwp)\"\n    gcc -dumpspecs | sed -e 's/-lmingwex/-lwindowsapp -lmingwex -lwindowsapp/' -e 's/-lmsvcrt/-lucrtapp/' > \"${specs}\"\n    CFLAGS=\"-specs=${specs}\"\n    CFLAGS_CMAKE=\"-specs=$(cygpath -w \"${specs}\")\"\n  fi\nfi\nif [ \"${MATRIX_BUILD}\" = 'cmake' ]; then\n  for _chkprefill in '' ${MATRIX_CHKPREFILL}; do\n    if [[ \"${MATRIX_ENV}\" = 'clang'* ]]; then\n      options='-DCMAKE_C_COMPILER=clang'\n    else\n      options='-DCMAKE_C_COMPILER=gcc'\n    fi\n    [ \"${MATRIX_SYS}\" = 'msys' ] && options+=' -D_CURL_PREFILL=ON'\n    [ \"${MATRIX_TEST}\" = 'uwp' ] && options+=' -DCMAKE_SYSTEM_NAME=WindowsStore'\n    [ \"${TFLAGS}\" = 'skiprun' ] && options+=' -D_CURL_SKIP_BUILD_CERTS=ON'\n    [ \"${_chkprefill}\" = '_chkprefill'\
+        \ ] && options+=' -D_CURL_PREFILL=OFF'\n    cmake -B \"bld${_chkprefill}\" -G Ninja ${options} \\\n      -DCMAKE_INSTALL_PREFIX=\"$HOME\"/curl-install \\\n      -DCMAKE_C_FLAGS=\"${CFLAGS_CMAKE} ${CPPFLAGS}\" \\\n      -DCMAKE_BUILD_TYPE=\"${MATRIX_TYPE}\" \\\n      -DCMAKE_UNITY_BUILD=ON -DCMAKE_UNITY_BUILD_BATCH_SIZE=30 \\\n      -DCURL_WERROR=ON \\\n      ${MATRIX_CONFIG}\n  done\n  if [ -d bld_chkprefill ] && ! diff -u bld/lib/curl_config.h bld_chkprefill/lib/curl_config.h; then\n    echo '::group::reference configure log'; cat bld_chkprefill/CMakeFiles/CMake*.yaml 2>/dev/null || true; echo '::endgroup::'\n    false\n  fi\nelse\n  export CFLAGS\n  mkdir bld && cd bld && ../configure --prefix=\"$HOME\"/curl-install --enable-unity --enable-warnings --enable-werror --disable-static \\\n    --disable-dependency-tracking --enable-option-checking=fatal \\\n    --with-libssh2 \\\n    ${MATRIX_CONFIG}\nfi\n"
+    - name: configure log
+      if: ${{ !cancelled() }}
+      run: cat bld/config.log bld/CMakeFiles/CMake*.yaml 2>/dev/null || true
+    - name: curl_config.h
+      run: 'echo ''::group::raw''; cat bld/lib/curl_config.h || true; echo ''::endgroup::''
+
+        grep -F ''#define'' bld/lib/curl_config.h | sort || true
+
+        '
+    - name: libcurl.pc, curl-config, cmake_install.cmake
+      run: "for f in libcurl.pc curl-config cmake_install.cmake; do\n  echo \"::group::${f}\"; grep -v '^#' bld/\"${f}\" || true; echo '::endgroup::'\ndone\nif command -v pccritic >/dev/null 2>&1; then\n  sed -i.bak 's/\\x0d//g' bld/libcurl.pc  # to suppress pccritic warning: style/PC061\n  pccritic --version\n  pccritic --min-score 100 bld/libcurl.pc\nfi\n"
+    - name: build
+      timeout-minutes: 10
+      run: "if [ \"${MATRIX_BUILD}\" = 'cmake' ]; then\n  cmake --build bld --verbose\n  cmake --install bld --verbose\nelse\n  make -C bld V=1 install\nfi\n"
+    - name: curl -V
+      timeout-minutes: 1
+      run: "if [ \"${MATRIX_BUILD}\" = 'cmake' ]; then\n  PATH=\"$PWD/bld/lib:$PATH\"\nelse\n  PATH=\"$PWD/bld/lib/.libs:$PATH\"\n  # avoid libtool's curl.exe wrapper for shared builds\n  mv bld/src/.libs/curl.exe bld/src/curl.exe || true\nfi\nfind . \\( -name '*.exe' -o -name '*.dll' -o -name '*.a' \\) -print0 | grep -z curl | sort -z | xargs -0 file --\nfind . \\( -name '*.exe' -o -name '*.dll' -o -name '*.a' \\) -print0 | grep -z curl | sort -z | xargs -0 stat -c '%10s bytes: %n' --\nif [ \"${MATRIX_TEST}\" != 'uwp' ]; then  # curl: error initializing curl library\n  bld/src/curl.exe --disable --version\nfi\n"
+    - name: build tests
+      if: ${{ matrix.tflags != 'skipall' }}
+      timeout-minutes: 10
+      run: "if [ \"${MATRIX_BUILD}\" = 'cmake' ]; then\n  cmake --build bld --verbose --target testdeps\nelse\n  make -C bld V=1 -C tests\nfi\nif [ \"${MATRIX_BUILD}\" != 'cmake' ]; then\n  # avoid libtool's .exe wrappers for shared builds\n  mv bld/tests/libtest/.libs/*.exe bld/tests/libtest || true\n  mv bld/tests/server/.libs/*.exe bld/tests/server || true\n  mv bld/tests/tunit/.libs/*.exe bld/tests/tunit || true\n  mv bld/tests/unit/.libs/*.exe bld/tests/unit || true\nfi\n"
+    - name: cache test prereqs (stunnel)
+      if: ${{ matrix.tflags != 'skipall' && matrix.tflags != 'skiprun' }}
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      id: cache-stunnel
+      with:
+        path: C:\my-stunnel
+        key: ${{ runner.os }}-stunnel-${{ env.STUNNEL_VERSION }}-amd64
+    - name: Prepare stunnel on this runner if uncached
+      if: ${{ !steps.cache-stunnel.outputs.cache-hit }}
+      timeout-minutes: 2
+      shell: bash
+      run: "cd /c && mkdir my-stunnel && cd my-stunnel\ncurl --disable --fail --silent --show-error --connect-timeout 15 --max-time 240 --retry 3 --retry-connrefused \\\n  \"https://www.stunnel.org/archive/5.x/stunnel-${STUNNEL_VERSION}-win64-installer.exe\" --output pkg.bin\nsha256sum pkg.bin && 7z x -y pkg.bin >/dev/null && rm -f pkg.bin && ls -l && bin/tstunnel -version\n"
+    - name: install test prereqs
+      if: ${{ matrix.tflags != 'skipall' && matrix.tflags != 'skiprun' }}
+      timeout-minutes: 2
+      run: "if [ -z \"${MATRIX_OPENSSH}\" ]; then  # MSYS2 openssh\n  /usr/bin/pacman --noconfirm --noprogressbar --sync --needed openssh\nelif [ \"${MATRIX_OPENSSH}\" = 'OpenSSH-Windows-builtin' ]; then\n  # https://learn.microsoft.com/windows-server/administration/openssh/openssh_install_firstuse\n  if [[ \"${MATRIX_IMAGE}\" = *'windows-2025'* ]]; then\n    pwsh -Command 'Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0'\n    pwsh -Command 'Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0'\n  fi\nelse  # OpenSSH-Windows\n  cd /c  # no D: drive on windows-11-arm runners\n  if [[ \"${MATRIX_IMAGE}\" = *'-arm'* ]]; then\n    curl --disable --fail --silent --show-error --connect-timeout 15 --max-time 60 --retry 3 --retry-connrefused \\\n      --location --proto-redir =https \"https://github.com/PowerShell/Win32-OpenSSH/releases/download/${OPENSSH_WINDOWS_VERSION}/OpenSSH-ARM64.zip\" --output pkg.bin\n    sha256sum pkg.bin && sha256sum pkg.bin | grep -qwF -- \"${OPENSSH_WINDOWS_SHA256_ARM64}\"\
+        \ && unzip pkg.bin && rm -f pkg.bin\n  else\n    curl --disable --fail --silent --show-error --connect-timeout 15 --max-time 60 --retry 3 --retry-connrefused \\\n      --location --proto-redir =https \"https://github.com/PowerShell/Win32-OpenSSH/releases/download/${OPENSSH_WINDOWS_VERSION}/OpenSSH-Win64.zip\" --output pkg.bin\n    sha256sum pkg.bin && sha256sum pkg.bin | grep -qwF -- \"${OPENSSH_WINDOWS_SHA256_WIN64}\" && unzip pkg.bin && rm -f pkg.bin\n  fi\nfi\n"
+    - name: Record process and socket baseline
+      shell: pwsh
+      run: 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name | ConvertTo-Json -Depth 4 | Set-Content diagnostics-output/process-baseline.json
+
+        Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess | ConvertTo-Json | Set-Content diagnostics-output/tcp-before.json
+
+        Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess | ConvertTo-Json | Set-Content diagnostics-output/udp-before.json
+
+        '
+    - name: run tests
+      if: ${{ matrix.tflags != 'skipall' && matrix.tflags != 'skiprun' }}
+      timeout-minutes: 12
+      env:
+        MATRIX_CONFIG: ${{ matrix.config }}
+        MATRIX_INSTALL: ${{ matrix.install }}
+        TFLAGS: ${{ matrix.tflags }}
+      run: "set +e\n(\n  set -e\nTFLAGS=\"-j8 ${TFLAGS}\"\nif [ \"${MATRIX_SYS}\" != 'msys' ]; then\n  TFLAGS+=' !498'  # 'Reject too large HTTP response headers on endless redirects' HTTP, HTTP GET (runtests detecting result code 2009 instead of 56 returned by curl)\n  TFLAGS+=' ~3000 ~3001 ~3023 ~3024'  # 'HTTPS localhost, first/last subject alt name matches, CN does not match' HTTPS, HTTP GET, PEM certificate (returning 56)\n  if [[ \"${MATRIX_INSTALL}\" = *'libssh2-wincng'* ]]; then\n    TFLAGS+=' ~SCP ~SFTP'  # Flaky: `-8, Unable to exchange encryption keys`. https://github.com/libssh2/libssh2/issues/804\n    unset CURL_TEST_SSH_KEYALGO  # libssh2 built with WinCNG does not support ssh-ed25519 hostkeys\n    export CURL_TEST_SSH_ENABLE_KEX=diffie-hellman-group16-sha512\n  fi\n  if [[ \"${MATRIX_CONFIG} \" = *'-DCURL_USE_LIBSSH=ON'* && \\\n        \"${MATRIX_ENV}\" = *'x86_64'* ]]; then\n    export CURL_TEST_SSH_DISABLE_KEX=mlkem768x25519-sha256  # broken with libssh 0.12.0 Windows x64\n\
+        \  fi\nfi\nif [ -n \"${MATRIX_OPENSSH}\" ]; then  # OpenSSH-Windows\n  TFLAGS+=' ~601 ~603 ~617 ~619 ~621 ~641 ~665 ~2004 ~3022'  # SCP\n  if [[ \"${MATRIX_CONFIG} \" = *'-DCURL_USE_LIBSSH=ON'* ]]; then\n    TFLAGS+=' ~614'  # 'SFTP pre-quote chmod' SFTP, pre-quote, directory\n  fi\nfi\nif [ \"${MATRIX_OPENSSH}\" = 'OpenSSH-Windows' ]; then\n  if [[ \"${MATRIX_IMAGE}\" = *'-arm'* ]]; then\n    PATH=\"/c/OpenSSH-ARM64:$PATH\"\n  else\n    PATH=\"/c/OpenSSH-Win64:$PATH\"\n  fi\nfi\nif [[ \"${MATRIX_INSTALL}\" != *'python'* ]]; then\n  export CURL_TEST_NO_PYTHON=1  # we have no Python here, skip tests needing it\nfi\nPATH=\"$PATH:/c/my-stunnel/bin\"\nif [ \"${MATRIX_BUILD}\" = 'cmake' ]; then\n  PATH=\"$PWD/bld/lib:$PATH\"\n  cmake --build bld --verbose --target test-ci\nelse\n  PATH=\"$PWD/bld/lib/.libs:$PATH\"\n  make -C bld V=1 test-ci\nfi\n\n) 2>&1 | tee diagnostics-output/test-console.log\ntest_status=${PIPESTATUS[0]}\nprintf '%s\\n' \"$test_status\" > diagnostics-output/test-exit-code.txt\n\
+        exit \"$test_status\"\n"
+    - name: Collect diagnostics and stop remaining test processes
+      if: ${{ always() }}
+      shell: pwsh
+      run: "$ErrorActionPreference = 'Continue'\nNew-Item -ItemType Directory -Force diagnostics-output | Out-Null\n$baseline = @()\nif (Test-Path diagnostics-output/process-baseline.json) { $baseline = @(Get-Content diagnostics-output/process-baseline.json -Raw | ConvertFrom-Json) }\n$processes = @(Get-CimInstance Win32_Process)\n$processes | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath | ConvertTo-Json -Depth 4 | Set-Content diagnostics-output/process-after-tests.json\n$owned = @($processes | Where-Object {\n  $p = $_\n  $existed = @($baseline | Where-Object { $_.ProcessId -eq $p.ProcessId -and $_.CreationDate -eq $p.CreationDate }).Count -gt 0\n  (-not $existed) -and ($p.ProcessId -ne $PID) -and (($p.ExecutablePath -like \"$env:GITHUB_WORKSPACE\\bld\\*\") -or ($baseline.Count -gt 0 -and $p.Name -in @('servers.exe','curl.exe','sshd.exe','stunnel.exe','tstunnel.exe','perl.exe')))\n})\n$owned | Select-Object ProcessId,CreationDate,Name | ConvertTo-Json -Depth\
+        \ 4 | Set-Content diagnostics-output/owned-processes-to-stop.json\nGet-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess | ConvertTo-Json | Set-Content diagnostics-output/tcp-after-tests.json\nGet-NetUDPEndpoint -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess | ConvertTo-Json | Set-Content diagnostics-output/udp-after-tests.json\nforeach ($p in $owned) {\n  $current = Get-CimInstance Win32_Process -Filter \"ProcessId=$($p.ProcessId)\" -ErrorAction SilentlyContinue\n  if ($current -and $current.CreationDate -eq $p.CreationDate) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }\n}\nStart-Sleep -Seconds 1\n$ids = @($owned | ForEach-Object { $_.ProcessId })\n$remaining = @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -in $ids })\n$remaining | Select-Object ProcessId,CreationDate,Name | ConvertTo-Json | Set-Content diagnostics-output/remaining-processes.json\n\
+        $tcp = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -in $ids })\n$udp = @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -in $ids })\n@{remaining_process_count=$remaining.Count; remaining_tcp_count=$tcp.Count; remaining_udp_count=$udp.Count} | ConvertTo-Json | Set-Content diagnostics-output/cleanup.json\nif ($remaining.Count -or $tcp.Count -or $udp.Count) { throw 'Test process/listener cleanup incomplete' }\n"
+    - name: Upload diagnostic evidence
+      if: ${{ always() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: windows-wolfssl-diagnostic
+        path: 'diagnostics-output/
+
+          bld/tests/log*/
+
+          bld/tests/*result*
+
+          bld/config.log
+
+          bld/lib/curl_config.h
+
+          '
+        if-no-files-found: warn
+        retention-days: 3
+        compression-level: 6
